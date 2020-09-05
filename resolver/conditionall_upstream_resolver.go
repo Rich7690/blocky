@@ -50,11 +50,16 @@ func (r *ConditionalUpstreamResolver) Resolve(request *Request) (*Response, erro
 					response, err := r.Resolve(request)
 					if err == nil {
 						response.Reason = "CONDITIONAL"
-						response.rType = CONDITIONAL
+						response.RType = CONDITIONAL
+					}
+
+					var answer string
+					if response != nil {
+						answer = util.AnswerToString(response.Res.Answer)
 					}
 
 					logger.WithFields(logrus.Fields{
-						"answer":   util.AnswerToString(response.Res.Answer),
+						"answer":   answer,
 						"domain":   domain,
 						"upstream": r,
 					}).Debugf("received response from conditional upstream")
@@ -71,11 +76,7 @@ func (r *ConditionalUpstreamResolver) Resolve(request *Request) (*Response, erro
 		}
 	}
 
-	logger.WithField("next_resolver", r.next).Trace("go to next resolver")
+	logger.WithField("next_resolver", Name(r.next)).Trace("go to next resolver")
 
 	return r.next.Resolve(request)
-}
-
-func (r ConditionalUpstreamResolver) String() string {
-	return fmt.Sprintf("conditional resolver")
 }

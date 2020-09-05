@@ -1,6 +1,7 @@
 package lists
 
 import (
+	"blocky/metrics"
 	"bufio"
 	"fmt"
 	"io"
@@ -12,13 +13,31 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 )
 
 const (
-	timeout              = 30 * time.Second
 	defaultRefreshPeriod = 4 * time.Hour
 )
+
+// nolint:gochecknoglobals
+var timeout = 30 * time.Second
+
+type ListCacheType int
+
+const (
+	BLACKLIST ListCacheType = iota
+	WHITELIST
+)
+
+func (l ListCacheType) String() string {
+	names := [...]string{
+		"blacklist",
+		"whitelist"}
+
+	return names[l]
+}
 
 type Matcher interface {
 	// matches passed domain name against cached list entries
@@ -34,6 +53,8 @@ type ListCache struct {
 
 	groupToLinks  map[string][]string
 	refreshPeriod time.Duration
+
+	counter *prometheus.GaugeVec
 }
 
 func (b *ListCache) Configuration() (result []string) {
@@ -65,24 +86,7 @@ func (b *ListCache) Configuration() (result []string) {
 	return
 }
 
-// removes duplicates
-func unique(in []string) []string {
-	keys := make(map[string]bool)
-
-	var list []string
-
-	for _, entry := range in {
-		if _, value := keys[entry]; !value {
-			keys[entry] = true
-
-			list = append(list, entry)
-		}
-	}
-
-	return list
-}
-
-func NewListCache(groupToLinks map[string][]string, refreshPeriod int) *ListCache {
+func NewListCache(t ListCacheType, groupToLinks map[string][]string, refreshPeriod int) *ListCache {
 	groupCaches := make(map[string][]string)
 
 	p := time.Duration(refreshPeriod) * time.Minute
@@ -90,10 +94,24 @@ func NewListCache(groupToLinks map[string][]string, refreshPeriod int) *ListCach
 		p = defaultRefreshPeriod
 	}
 
+	var counter *prometheus.GaugeVec
+
+	if metrics.IsEnabled() {
+		counter = prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: fmt.Sprintf("blocky_%s_cache", t),
+				Help: "Number of entries in cache",
+			}, []string{"group"},
+		)
+
+		metrics.RegisterMetric(counter)
+	}
+
 	b := &ListCache{
 		groupToLinks:  groupToLinks,
 		groupCaches:   groupCaches,
 		refreshPeriod: p,
+		counter:       counter,
 	}
 	b.refresh()
 
@@ -123,6 +141,8 @@ func logger() *logrus.Entry {
 func createCacheForGroup(links []string) []string {
 	cache := make([]string, 0)
 
+	keys := make(map[string]bool)
+
 	var wg sync.WaitGroup
 
 	c := make(chan []string, len(links))
@@ -139,14 +159,21 @@ Loop:
 	for {
 		select {
 		case res := <-c:
-			cache = append(cache, res...)
+			if res == nil {
+				return nil
+			}
+			for _, entry := range res {
+				if _, value := keys[entry]; !value {
+					keys[entry] = true
+					cache = append(cache, entry)
+				}
+			}
 		default:
 			close(c)
 			break Loop
 		}
 	}
 
-	cache = unique(cache)
 	sort.Strings(cache)
 
 	return cache
@@ -175,11 +202,20 @@ func contains(domain string, cache []string) bool {
 }
 
 func (b *ListCache) refresh() {
-	b.lock.Lock()
-	defer b.lock.Unlock()
-
 	for group, links := range b.groupToLinks {
-		b.groupCaches[group] = createCacheForGroup(links)
+		cacheForGroup := createCacheForGroup(links)
+
+		if cacheForGroup != nil {
+			b.lock.Lock()
+			b.groupCaches[group] = cacheForGroup
+			b.lock.Unlock()
+		} else {
+			logger().Warn("Populating of group cache failed, leaving items from last successful download in cache")
+		}
+
+		if metrics.IsEnabled() {
+			b.counter.WithLabelValues(group).Set(float64(len(b.groupCaches[group])))
+		}
 
 		logger().WithFields(logrus.Fields{
 			"group":       group,
@@ -193,16 +229,37 @@ func downloadFile(link string) (io.ReadCloser, error) {
 		Timeout: timeout,
 	}
 
+	var resp *http.Response
+
+	var err error
+
 	logger().WithField("link", link).Info("starting download")
 
-	//nolint:bodyclose
-	resp, err := client.Get(link)
+	attempt := 1
 
-	if err != nil {
-		return nil, err
+	for attempt <= 3 {
+		//nolint:bodyclose
+		if resp, err = client.Get(link); err == nil {
+			if resp.StatusCode == http.StatusOK {
+				return resp.Body, nil
+			}
+
+			resp.Body.Close()
+
+			return nil, fmt.Errorf("couldn't download url, got status code %d", resp.StatusCode)
+		}
+
+		if errNet, ok := err.(net.Error); ok && (errNet.Timeout() || errNet.Temporary()) {
+			logger().WithField("link", link).WithField("attempt",
+				attempt).Warnf("Temporary network error / Timeout occurred, retrying... %s", errNet)
+			time.Sleep(time.Second)
+			attempt++
+		} else {
+			return nil, err
+		}
 	}
 
-	return resp.Body, nil
+	return nil, err
 }
 
 func readFile(file string) (io.ReadCloser, error) {
@@ -230,6 +287,14 @@ func processFile(link string, ch chan<- []string, wg *sync.WaitGroup) {
 
 	if err != nil {
 		logger().Warn("error during file processing: ", err)
+
+		if errNet, ok := err.(net.Error); ok && (errNet.Timeout() || errNet.Temporary()) {
+			// put nil to indicate the temporary error
+			ch <- nil
+			return
+		}
+		ch <- []string{}
+
 		return
 	}
 	defer r.Close()
@@ -243,6 +308,7 @@ func processFile(link string, ch chan<- []string, wg *sync.WaitGroup) {
 		// skip comments
 		if !strings.HasPrefix(line, "#") {
 			result = append(result, processLine(line))
+
 			count++
 		}
 	}

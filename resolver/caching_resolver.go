@@ -21,13 +21,6 @@ const (
 	cacheTimeNegative = 30 * time.Minute
 )
 
-type Type uint8
-
-const (
-	A Type = iota
-	AAAA
-)
-
 func NewCachingResolver(cfg config.CachingConfig) ChainedResolver {
 	return &CachingResolver{
 		minCacheTimeSec: 60 * cfg.MinCachingTime,
@@ -53,8 +46,8 @@ func (r *CachingResolver) Configuration() (result []string) {
 
 	result = append(result, fmt.Sprintf("maxCacheTimeSec = %d", r.maxCacheTimeSec))
 
-	for t, cache := range r.cachesPerType {
-		result = append(result, fmt.Sprintf("%s cache items count = %d", dns.TypeToString[t], cache.ItemCount()))
+	for t, c := range r.cachesPerType {
+		result = append(result, fmt.Sprintf("%s cache items count = %d", dns.TypeToString[t], c.ItemCount()))
 	}
 
 	return
@@ -75,7 +68,7 @@ func (r *CachingResolver) Resolve(request *Request) (response *Response, err err
 		domain := util.ExtractDomain(question)
 		logger := logger.WithField("domain", domain)
 
-		// we caching only A and AAAA queries
+		// we can cache only A and AAAA queries
 		if question.Qtype == dns.TypeA || question.Qtype == dns.TypeAAAA {
 			val, expiresAt, found := r.getCache(question.Qtype).GetWithExpiration(domain)
 
@@ -93,15 +86,15 @@ func (r *CachingResolver) Resolve(request *Request) (response *Response, err err
 						rr.Header().Ttl = remainingTTL
 					}
 
-					return &Response{Res: resp, rType: CACHED, Reason: "CACHED"}, nil
+					return &Response{Res: resp, RType: CACHED, Reason: "CACHED"}, nil
 				}
 				// Answer with response code != OK
 				resp.Rcode = val.(int)
 
-				return &Response{Res: resp, rType: CACHED, Reason: "CACHED NEGATIVE"}, nil
+				return &Response{Res: resp, RType: CACHED, Reason: "CACHED NEGATIVE"}, nil
 			}
 
-			logger.WithField("next_resolver", r.next).Debug("not in cache: go to next resolver")
+			logger.WithField("next_resolver", Name(r.next)).Debug("not in cache: go to next resolver")
 			response, err = r.next.Resolve(request)
 
 			if err == nil {
@@ -149,8 +142,4 @@ func (r *CachingResolver) adjustTTLs(answer []dns.RR) (maxTTL uint32) {
 	}
 
 	return
-}
-
-func (r CachingResolver) String() string {
-	return fmt.Sprintf("caching resolver")
 }

@@ -2,7 +2,6 @@ package resolver
 
 import (
 	"blocky/config"
-	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -38,8 +37,6 @@ func (r *resolverMock) Resolve(req *Request) (*Response, error) {
 func TestDOHUpstream(fn func(request *dns.Msg) (response *dns.Msg),
 	reqFn ...func(w http.ResponseWriter)) config.Upstream {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Printf("here")
-
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			log.Fatal("can't read request: ", err)
@@ -60,7 +57,9 @@ func TestDOHUpstream(fn func(request *dns.Msg) (response *dns.Msg),
 		w.Header().Set("content-type", "application/dns-message")
 
 		for _, f := range reqFn {
-			f(w)
+			if f != nil {
+				f(w)
+			}
 		}
 		_, err = w.Write(b)
 		if err != nil {
@@ -76,6 +75,7 @@ func TestDOHUpstream(fn func(request *dns.Msg) (response *dns.Msg),
 	return upstream
 }
 
+//nolint:funlen
 func TestUDPUpstream(fn func(request *dns.Msg) (response *dns.Msg)) config.Upstream {
 	a, err := net.ResolveUDPAddr("udp4", ":0")
 	if err != nil {
@@ -114,7 +114,18 @@ func TestUDPUpstream(fn func(request *dns.Msg) (response *dns.Msg)) config.Upstr
 			}
 
 			response := fn(msg)
+			// nil should indicate an error
+			if response == nil {
+				_, _ = ln.WriteToUDP([]byte("dummy"), addr)
+				continue
+			}
+
+			rCode := response.Rcode
 			response.SetReply(msg)
+
+			if rCode != 0 {
+				response.Rcode = rCode
+			}
 
 			b, err := response.Pack()
 			if err != nil {
@@ -128,5 +139,5 @@ func TestUDPUpstream(fn func(request *dns.Msg) (response *dns.Msg)) config.Upstr
 		}
 	}()
 
-	return config.Upstream{Net: "udp", Host: host, Port: port}
+	return config.Upstream{Net: "tcp+udp", Host: host, Port: port}
 }

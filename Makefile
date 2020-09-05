@@ -1,4 +1,4 @@
-.PHONY: all clean build test lint run buildMultiArchRelease docker-buildx-push help
+.PHONY: all tools clean build test lint run buildMultiArchRelease docker-buildx-push help
 .DEFAULT_GOAL := help
 
 VERSION := $(shell git describe --always --tags)
@@ -7,26 +7,33 @@ DOCKER_IMAGE_NAME="spx01/blocky"
 BINARY_NAME=blocky
 BIN_OUT_DIR=bin
 
+tools: ## prepare build tools
+	mkdir -p ~/.docker && echo "{\"experimental\": \"enabled\"}" > ~/.docker/config.json
+	go get github.com/swaggo/swag/cmd/swag@v1.6.5
+
 all: test lint build ## Build binary (with tests)
 
 clean: ## cleans output directory
 	$(shell rm -rf $(BIN_OUT_DIR)/*)
 
 build:  ## Build binary
-	go build -v -ldflags="-w -s -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" -o $(BIN_OUT_DIR)/$(BINARY_NAME)$(BINARY_SUFFIX)
+	$(shell go env GOPATH)/bin/swag init -g api/api.go
+	go build -v -ldflags="-w -s -X blocky/cmd.version=${VERSION} -X blocky/cmd.buildTime=${BUILD_TIME}" -o $(BIN_OUT_DIR)/$(BINARY_NAME)$(BINARY_SUFFIX)
 
 test:  ## run tests
 	go test -v -coverprofile=coverage.txt -covermode=atomic -cover ./...
 
-lint: ## run golangcli-lint checks
+lint: build ## run golangcli-lint checks
 	$(shell go env GOPATH)/bin/golangci-lint run
 
 run: build ## Build and run binary
 	./$(BIN_OUT_DIR)/$(BINARY_NAME)
 
 buildMultiArchRelease: ## builds binary for multiple archs
-	$(MAKE) build GOARCH=arm GOARM=6 BINARY_SUFFIX=_${VERSION}_arm32v6
-	$(MAKE) build GOARCH=amd64 BINARY_SUFFIX=_${VERSION}_amd64
+	$(MAKE) build GOOS=linux GOARCH=arm GOARM=6 BINARY_SUFFIX=_${VERSION}_linux_arm32v6
+	$(MAKE) build GOOS=linux GOARCH=amd64 BINARY_SUFFIX=_${VERSION}_linux_amd64
+	$(MAKE) build GOOS=linux GOARCH=arm64 BINARY_SUFFIX=_${VERSION}_linux_arm64
+	$(MAKE) build GOOS=windows GOARCH=amd64 BINARY_SUFFIX=_${VERSION}_windows_amd64.exe
 
 docker-buildx-push:  ## Build multi arch docker images and push
 	docker buildx build \

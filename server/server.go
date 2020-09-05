@@ -2,17 +2,18 @@ package server
 
 import (
 	"blocky/config"
+	"blocky/metrics"
 	"blocky/resolver"
-	"os"
-	"os/signal"
+	"net/http"
 	"runtime"
 	"runtime/debug"
-	"syscall"
+	"time"
 
 	"blocky/util"
 	"fmt"
 	"net"
 
+	"github.com/go-chi/chi"
 	"github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )
@@ -20,58 +21,98 @@ import (
 type Server struct {
 	udpServer     *dns.Server
 	tcpServer     *dns.Server
+	httpListener  net.Listener
+	httpsListener net.Listener
 	queryResolver resolver.Resolver
+	cfg           *config.Config
+	httpMux       *chi.Mux
 }
 
 func logger() *logrus.Entry {
 	return logrus.WithField("prefix", "server")
 }
 
-func NewServer(cfg *config.Config) (*Server, error) {
-	udpHandler := dns.NewServeMux()
-	tcpHandler := dns.NewServeMux()
+func NewServer(cfg *config.Config) (server *Server, err error) {
 	udpServer := &dns.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.Port),
 		Net:     "udp",
-		Handler: udpHandler,
+		Handler: dns.NewServeMux(),
 		NotifyStartedFunc: func() {
-			logger().Infof("udp server is up and running")
+			logger().Infof("udp server is up and running on port %d", cfg.Port)
 		},
 		UDPSize: 65535}
 	tcpServer := &dns.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.Port),
 		Net:     "tcp",
-		Handler: tcpHandler,
+		Handler: dns.NewServeMux(),
 		NotifyStartedFunc: func() {
-			logger().Infof("tcp server is up and running")
+			logger().Infof("tcp server is up and running on port %d", cfg.Port)
 		},
 	}
 
-	queryResolver := resolver.Chain(
-		resolver.NewClientNamesResolver(cfg.ClientLookup),
-		resolver.NewQueryLoggingResolver(cfg.QueryLog),
-		resolver.NewStatsResolver(),
-		resolver.NewConditionalUpstreamResolver(cfg.Conditional),
-		resolver.NewCustomDNSResolver(cfg.CustomDNS),
-		resolver.NewBlockingResolver(cfg.Blocking),
-		resolver.NewCachingResolver(cfg.Caching),
-		createParallelUpstreamResolver(cfg.Upstream.ExternalResolvers),
-	)
+	var httpListener, httpsListener net.Listener
 
-	server := Server{
+	router := createRouter(cfg)
+
+	if cfg.HTTPPort > 0 {
+		if httpListener, err = net.Listen("tcp", fmt.Sprintf(":%d", cfg.HTTPPort)); err != nil {
+			return nil, fmt.Errorf("start http listener on port %d failed: %v", cfg.HTTPPort, err)
+		}
+
+		metrics.Start(router, cfg.Prometheus)
+	}
+
+	if cfg.HTTPSPort > 0 {
+		if cfg.CertFile == "" || cfg.KeyFile == "" {
+			return nil, fmt.Errorf("httpsCertFile and httpsKeyFile parameters are mandatory for HTTPS")
+		}
+
+		if httpsListener, err = net.Listen("tcp", fmt.Sprintf(":%d", cfg.HTTPSPort)); err != nil {
+			return nil, fmt.Errorf("start https listener on port %d failed: %v", cfg.HTTPSPort, err)
+		}
+
+		metrics.Start(router, cfg.Prometheus)
+	}
+
+	queryResolver := createQueryResolver(cfg, router)
+
+	server = &Server{
 		udpServer:     udpServer,
 		tcpServer:     tcpServer,
 		queryResolver: queryResolver,
+		cfg:           cfg,
+		httpListener:  httpListener,
+		httpsListener: httpsListener,
+		httpMux:       router,
 	}
 
 	server.printConfiguration()
 
-	udpHandler.HandleFunc(".", server.OnRequest)
-	udpHandler.HandleFunc("healthcheck.blocky", server.OnHealthCheck)
-	tcpHandler.HandleFunc(".", server.OnRequest)
-	tcpHandler.HandleFunc("healthcheck.blocky", server.OnHealthCheck)
+	server.registerDNSHandlers(udpServer)
+	server.registerDNSHandlers(tcpServer)
+	server.registerAPIEndpoints(router)
 
-	return &server, nil
+	return server, nil
+}
+
+func createQueryResolver(cfg *config.Config, router *chi.Mux) resolver.Resolver {
+	return resolver.Chain(
+		resolver.NewClientNamesResolver(cfg.ClientLookup),
+		resolver.NewQueryLoggingResolver(cfg.QueryLog),
+		resolver.NewStatsResolver(),
+		resolver.NewMetricsResolver(cfg.Prometheus),
+		resolver.NewConditionalUpstreamResolver(cfg.Conditional),
+		resolver.NewCustomDNSResolver(cfg.CustomDNS),
+		resolver.NewBlockingResolver(router, cfg.Blocking),
+		resolver.NewCachingResolver(cfg.Caching),
+		resolver.NewParallelBestResolver(cfg.Upstream),
+	)
+}
+
+func (s *Server) registerDNSHandlers(server *dns.Server) {
+	handler := server.Handler.(*dns.ServeMux)
+	handler.HandleFunc(".", s.OnRequest)
+	handler.HandleFunc("healthcheck.blocky", s.OnHealthCheck)
 }
 
 func (s *Server) printConfiguration() {
@@ -79,7 +120,7 @@ func (s *Server) printConfiguration() {
 
 	res := s.queryResolver
 	for res != nil {
-		logger().Infof("-> resolver: '%s'", res)
+		logger().Infof("-> resolver: '%s'", resolver.Name(res))
 
 		for _, c := range res.Configuration() {
 			logger().Infof("     %s", c)
@@ -91,6 +132,9 @@ func (s *Server) printConfiguration() {
 			break
 		}
 	}
+
+	logger().Infof("- DNS listening port: %d", s.cfg.Port)
+	logger().Infof("- HTTP listening port: %d", s.cfg.HTTPPort)
 
 	logger().Info("runtime information:")
 
@@ -115,20 +159,6 @@ func toMB(b uint64) uint64 {
 	return b / 1024 / 1024
 }
 
-func createParallelUpstreamResolver(upstream []config.Upstream) resolver.Resolver {
-	if len(upstream) == 1 {
-		return resolver.NewUpstreamResolver(upstream[0])
-	}
-
-	resolvers := make([]resolver.Resolver, len(upstream))
-
-	for i, u := range upstream {
-		resolvers[i] = resolver.NewUpstreamResolver(u)
-	}
-
-	return resolver.NewParallelBestResolver(resolvers)
-}
-
 func (s *Server) Start() {
 	logger().Info("Starting server")
 
@@ -144,15 +174,27 @@ func (s *Server) Start() {
 		}
 	}()
 
-	signals := make(chan os.Signal)
-	signal.Notify(signals, syscall.SIGUSR1)
-
 	go func() {
-		for {
-			<-signals
-			s.printConfiguration()
+		if s.httpListener != nil {
+			logger().Infof("http server is up and running on port %d", s.cfg.HTTPPort)
+
+			if err := http.Serve(s.httpListener, s.httpMux); err != nil {
+				logger().Fatalf("start http listener failed: %v", err)
+			}
 		}
 	}()
+
+	go func() {
+		if s.httpsListener != nil {
+			logger().Infof("https server is up and running on port %d", s.cfg.HTTPSPort)
+
+			if err := http.ServeTLS(s.httpsListener, s.httpMux, s.cfg.CertFile, s.cfg.KeyFile); err != nil {
+				logger().Fatalf("start https listener failed: %v", err)
+			}
+		}
+	}()
+
+	registerPrintConfigurationTrigger(s)
 }
 
 func (s *Server) Stop() {
@@ -167,18 +209,29 @@ func (s *Server) Stop() {
 	}
 }
 
-func (s *Server) OnRequest(w dns.ResponseWriter, request *dns.Msg) {
-	logger().Debug("new request")
+func createResolverRequest(remoteAddress net.Addr, request *dns.Msg) *resolver.Request {
+	clientIP, protocol := resolveClientIPAndProtocol(remoteAddress)
 
-	clientIP := resolveClientIP(w.RemoteAddr())
-	r := &resolver.Request{
-		ClientIP: clientIP,
-		Req:      request,
+	return newRequest(clientIP, protocol, request)
+}
+
+func newRequest(clientIP net.IP, protocol resolver.RequestProtocol, request *dns.Msg) *resolver.Request {
+	return &resolver.Request{
+		ClientIP:  clientIP,
+		Protocol:  protocol,
+		Req:       request,
+		RequestTS: time.Now(),
 		Log: logrus.WithFields(logrus.Fields{
 			"question":  util.QuestionToString(request.Question),
 			"client_ip": clientIP,
 		}),
 	}
+}
+
+func (s *Server) OnRequest(w dns.ResponseWriter, request *dns.Msg) {
+	logger().Debug("new request")
+
+	r := createResolverRequest(w.RemoteAddr(), request)
 
 	response, err := s.queryResolver.Resolve(r)
 
@@ -194,7 +247,7 @@ func (s *Server) OnRequest(w dns.ResponseWriter, request *dns.Msg) {
 	}
 }
 
-// Handler for docker healthcheck. Just returns OK code without delegating to resolver chain
+// Handler for docker health check. Just returns OK code without delegating to resolver chain
 func (s *Server) OnHealthCheck(w dns.ResponseWriter, request *dns.Msg) {
 	resp := new(dns.Msg)
 	resp.SetReply(request)
@@ -205,13 +258,12 @@ func (s *Server) OnHealthCheck(w dns.ResponseWriter, request *dns.Msg) {
 	}
 }
 
-func resolveClientIP(addr net.Addr) net.IP {
-	var clientIP net.IP
+func resolveClientIPAndProtocol(addr net.Addr) (ip net.IP, protocol resolver.RequestProtocol) {
 	if t, ok := addr.(*net.UDPAddr); ok {
-		clientIP = t.IP
+		return t.IP, resolver.UDP
 	} else if t, ok := addr.(*net.TCPAddr); ok {
-		clientIP = t.IP
+		return t.IP, resolver.TCP
 	}
 
-	return clientIP
+	return nil, resolver.TCP
 }

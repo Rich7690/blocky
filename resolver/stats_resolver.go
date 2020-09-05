@@ -4,10 +4,7 @@ import (
 	"blocky/stats"
 	"blocky/util"
 	"fmt"
-	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 
 	"github.com/jedib0t/go-pretty/table"
 	"github.com/miekg/dns"
@@ -73,10 +70,6 @@ func (r *StatsResolver) Configuration() (result []string) {
 	return
 }
 
-func (r StatsResolver) String() string {
-	return fmt.Sprintf("statistic resolver")
-}
-
 func (r *resolverStatRecorder) recordStats(e *statsEntry) {
 	r.aggregator.Put(r.fn(e))
 }
@@ -89,21 +82,13 @@ func NewStatsResolver() ChainedResolver {
 
 	go resolver.collectStats()
 
-	signals := make(chan os.Signal)
-	signal.Notify(signals, syscall.SIGUSR2)
-
-	go func() {
-		for {
-			<-signals
-			resolver.printStats()
-		}
-	}()
+	registerStatsTrigger(resolver)
 
 	return resolver
 }
 
 func (r *StatsResolver) printStats() {
-	logger := logger("stats_resover")
+	logger := logger("stats_resolver")
 
 	w := logger.Writer()
 	defer w.Close()
@@ -131,7 +116,7 @@ func createRecorders() []*resolverStatRecorder {
 			return util.ExtractDomain(e.request.Req.Question[0])
 		}),
 		newRecorderWithMax("Top 20 blocked queries", 20, func(e *statsEntry) string {
-			if e.response.rType == BLOCKED {
+			if e.response.RType == BLOCKED {
 				return util.ExtractDomain(e.request.Req.Question[0])
 			}
 			return ""
@@ -143,7 +128,7 @@ func createRecorders() []*resolverStatRecorder {
 			return e.response.Reason
 		}),
 		newRecorder("Query type", func(e *statsEntry) string {
-			return util.QTypeToString()(e.request.Req.Question[0].Qtype)
+			return dns.TypeToString[e.request.Req.Question[0].Qtype]
 		}),
 		newRecorder("Response type", func(e *statsEntry) string {
 			return dns.RcodeToString[e.response.Res.Rcode]

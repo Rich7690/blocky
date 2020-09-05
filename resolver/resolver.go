@@ -1,17 +1,57 @@
 package resolver
 
 import (
+	"blocky/util"
+	"fmt"
 	"net"
+	"strings"
+	"time"
 
 	"github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )
 
+type RequestProtocol uint8
+
+const (
+	TCP RequestProtocol = iota
+	UDP
+)
+
+func (r RequestProtocol) String() string {
+	names := [...]string{
+		"TCP",
+		"UDP"}
+
+	return names[r]
+}
+
 type Request struct {
 	ClientIP    net.IP
+	Protocol    RequestProtocol
 	ClientNames []string
 	Req         *dns.Msg
 	Log         *logrus.Entry
+	RequestTS   time.Time
+}
+
+func newRequest(question string, rType uint16) *Request {
+	return &Request{
+		Req:      util.NewMsgWithQuestion(question, rType),
+		Log:      logrus.NewEntry(logrus.New()),
+		Protocol: UDP,
+	}
+}
+
+func newRequestWithClient(question string, rType uint16, ip string, clientNames ...string) *Request {
+	return &Request{
+		ClientIP:    net.ParseIP(ip),
+		ClientNames: clientNames,
+		Req:         util.NewMsgWithQuestion(question, rType),
+		Log:         logrus.NewEntry(logrus.New()),
+		RequestTS:   time.Time{},
+		Protocol:    UDP,
+	}
 }
 
 type ResponseType int
@@ -24,10 +64,21 @@ const (
 	CUSTOMDNS
 )
 
+func (r ResponseType) String() string {
+	names := [...]string{
+		"RESOLVED",
+		"CACHED",
+		"BLOCKED",
+		"CONDITIONAL",
+		"CUSTOMDNS"}
+
+	return names[r]
+}
+
 type Response struct {
 	Res    *dns.Msg
 	Reason string
-	rType  ResponseType
+	RType  ResponseType
 }
 type Resolver interface {
 	Resolve(req *Request) (*Response, error)
@@ -70,4 +121,8 @@ func Chain(resolvers ...Resolver) Resolver {
 	}
 
 	return resolvers[0]
+}
+
+func Name(resolver Resolver) string {
+	return strings.Split(fmt.Sprintf("%T", resolver), ".")[1]
 }
