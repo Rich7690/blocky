@@ -2,29 +2,30 @@ package cmd
 
 import (
 	"blocky/api"
+	"blocky/util"
 	"bytes"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
 
+	"blocky/log"
+
 	"github.com/miekg/dns"
 	"github.com/spf13/cobra"
-
-	log "github.com/sirupsen/logrus"
 )
 
-//nolint:gochecknoinits
-func init() {
-	rootCmd.AddCommand(queryCmd)
-	queryCmd.Flags().StringP("type", "t", "A", "query type (A, AAAA, ...)")
-}
+// NewQueryCommand creates new command instance
+func NewQueryCommand() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "query <domain>",
+		Args:  cobra.ExactArgs(1),
+		Short: "performs DNS query",
+		Run:   query,
+	}
 
-//nolint:gochecknoglobals
-var queryCmd = &cobra.Command{
-	Use:   "query <domain>",
-	Args:  cobra.ExactArgs(1),
-	Short: "performs DNS query",
-	Run:   query,
+	c.Flags().StringP("type", "t", "A", "query type (A, AAAA, ...)")
+
+	return c
 }
 
 func query(cmd *cobra.Command, args []string) {
@@ -32,7 +33,8 @@ func query(cmd *cobra.Command, args []string) {
 	qType := dns.StringToType[typeFlag]
 
 	if qType == dns.TypeNone {
-		log.Fatalf("unknown query type '%s'", typeFlag)
+		log.Log().Fatalf("unknown query type '%s'", typeFlag)
+		return
 	}
 
 	apiRequest := api.QueryRequest{
@@ -41,10 +43,10 @@ func query(cmd *cobra.Command, args []string) {
 	}
 	jsonValue, _ := json.Marshal(apiRequest)
 
-	resp, err := http.Post(apiURL(api.BlockingQueryPath), "application/json", bytes.NewBuffer(jsonValue))
+	resp, err := http.Post(apiURL(api.PathQueryPath), "application/json", bytes.NewBuffer(jsonValue))
 
 	if err != nil {
-		log.Fatal("can't execute", err)
+		log.Log().Fatal("can't execute", err)
 
 		return
 	}
@@ -52,7 +54,7 @@ func query(cmd *cobra.Command, args []string) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
-		log.Fatalf("NOK: %s %s", resp.Status, string(body))
+		log.Log().Fatalf("NOK: %s %s", resp.Status, string(body))
 
 		return
 	}
@@ -60,15 +62,11 @@ func query(cmd *cobra.Command, args []string) {
 	var result api.QueryResult
 	err = json.NewDecoder(resp.Body).Decode(&result)
 
-	if err != nil {
-		log.Fatal("can't read response: ", err)
+	util.FatalOnError("can't read response: ", err)
 
-		return
-	}
-
-	log.Infof("Query result for '%s' (%s):", apiRequest.Query, apiRequest.Type)
-	log.Infof("\treason:        %20s", result.Reason)
-	log.Infof("\tresponse type: %20s", result.ResponseType)
-	log.Infof("\tresponse:      %20s", result.Response)
-	log.Infof("\treturn code:   %20s", result.ReturnCode)
+	log.Log().Infof("Query result for '%s' (%s):", apiRequest.Query, apiRequest.Type)
+	log.Log().Infof("\treason:        %20s", result.Reason)
+	log.Log().Infof("\tresponse type: %20s", result.ResponseType)
+	log.Log().Infof("\tresponse:      %20s", result.Response)
+	log.Log().Infof("\treturn code:   %20s", result.ReturnCode)
 }

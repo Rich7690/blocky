@@ -5,25 +5,32 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
-	"reflect"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
+	"blocky/log"
 
 	"gopkg.in/yaml.v2"
 )
 
 const (
 	validUpstream = `(?P<Host>(?:\[[^\]]+\])|[^\s/:]+):?(?P<Port>[^\s/:]*)?(?P<Path>/[^\s]*)?`
-	// deprecated
+	// NetUDP UDP protocol (deprecated)
 	NetUDP = "udp"
-	// deprecated
-	NetTCP    = "tcp"
+
+	// NetTCP TCP protocol (deprecated)
+	NetTCP = "tcp"
+
+	// NetTCPUDP TCP and UDP protocols
 	NetTCPUDP = "tcp+udp"
+
+	// NetTCPTLS TCP-TLS protocol
 	NetTCPTLS = "tcp-tls"
-	NetHTTPS  = "https"
+
+	// NetHTTPS HTTPS protocol
+	NetHTTPS = "https"
 )
 
 // nolint:gochecknoglobals
@@ -41,6 +48,7 @@ type Upstream struct {
 	Path string
 }
 
+// UnmarshalYAML creates Upstream from YAML
 func (u *Upstream) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var s string
 	if err := unmarshal(&s); err != nil {
@@ -53,6 +61,64 @@ func (u *Upstream) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	}
 
 	*u = upstream
+
+	return nil
+}
+
+// UnmarshalYAML creates ConditionalUpstreamMapping from YAML
+func (c *ConditionalUpstreamMapping) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var input map[string]string
+	if err := unmarshal(&input); err != nil {
+		return err
+	}
+
+	result := make(map[string][]Upstream)
+
+	for k, v := range input {
+		var upstreams []Upstream
+
+		for _, part := range strings.Split(v, ",") {
+			upstream, err := ParseUpstream(strings.TrimSpace(part))
+			if err != nil {
+				return err
+			}
+
+			upstreams = append(upstreams, upstream)
+		}
+
+		result[k] = upstreams
+	}
+
+	c.Upstreams = result
+
+	return nil
+}
+
+// UnmarshalYAML creates CustomDNSMapping from YAML
+func (c *CustomDNSMapping) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var input map[string]string
+	if err := unmarshal(&input); err != nil {
+		return err
+	}
+
+	result := make(map[string][]net.IP)
+
+	for k, v := range input {
+		var ips []net.IP
+
+		for _, part := range strings.Split(v, ",") {
+			ip := net.ParseIP(strings.TrimSpace(part))
+			if ip == nil {
+				return fmt.Errorf("invalid IP address '%s'", part)
+			}
+
+			ips = append(ips, ip)
+		}
+
+		result[k] = ips
+	}
+
+	c.HostIPs = result
 
 	return nil
 }
@@ -71,22 +137,7 @@ func ParseUpstream(upstream string) (result Upstream, err error) {
 
 	match := r.FindStringSubmatch(upstream)
 
-	if len(match) == 0 {
-		err = fmt.Errorf("wrong configuration, couldn't parse input '%s', please enter [net:]host[:port][/path]", upstream)
-		return
-	}
-
-	if _, ok := netDefaultPort[n]; !ok {
-		err = fmt.Errorf("wrong configuration, couldn't parse net '%s', please use one of %s",
-			n, reflect.ValueOf(netDefaultPort).MapKeys())
-		return
-	}
-
 	host := match[1]
-	if len(host) == 0 {
-		err = errors.New("wrong configuration, host wasn't specified")
-		return
-	}
 
 	portPart := match[2]
 
@@ -95,16 +146,11 @@ func ParseUpstream(upstream string) (result Upstream, err error) {
 	var port uint16
 
 	if len(portPart) > 0 {
-		var p int
-		p, err = strconv.Atoi(strings.TrimSpace(portPart))
+		var p uint64
+		p, err = strconv.ParseUint(strings.TrimSpace(portPart), 10, 16)
 
 		if err != nil {
-			err = fmt.Errorf("can't convert port to number %v", err)
-			return
-		}
-
-		if p < 1 || p > 65535 {
-			err = fmt.Errorf("invalid port %d", p)
+			err = fmt.Errorf("can't convert port to number (1 - 65535) %w", err)
 			return
 		}
 
@@ -113,18 +159,20 @@ func ParseUpstream(upstream string) (result Upstream, err error) {
 		port = netDefaultPort[n]
 	}
 
+	host = regexp.MustCompile(`[\[\]]`).ReplaceAllString(host, "")
+
 	return Upstream{Net: n, Host: host, Port: port, Path: path}, nil
 }
 
 func extractNet(upstream string) (string, string) {
 	if strings.HasPrefix(upstream, NetTCP+":") {
-		log.Warnf("net prefix tcp is deprecated, using tcp+udp as default fallback")
+		log.Log().Warnf("net prefix tcp is deprecated, using tcp+udp as default fallback")
 
 		return NetTCPUDP, strings.Replace(upstream, NetTCP+":", "", 1)
 	}
 
 	if strings.HasPrefix(upstream, NetUDP+":") {
-		log.Warnf("net prefix udp is deprecated, using tcp+udp as default fallback")
+		log.Log().Warnf("net prefix udp is deprecated, using tcp+udp as default fallback")
 		return NetTCPUDP, strings.Replace(upstream, NetUDP+":", "", 1)
 	}
 
@@ -144,16 +192,12 @@ func extractNet(upstream string) (string, string) {
 }
 
 const (
-	cfgDefaultPort           = 53
+	cfgDefaultPort           = "53"
 	cfgDefaultPrometheusPath = "/metrics"
 )
 
-const (
-	CfgLogFormatText = "text"
-	CfgLogFormatJSON = "json"
-)
-
-// main configuration
+// Config main configuration
+// nolint:maligned
 type Config struct {
 	Upstream     UpstreamConfig            `yaml:"upstream"`
 	CustomDNS    CustomDNSConfig           `yaml:"customDNS"`
@@ -165,9 +209,11 @@ type Config struct {
 	Prometheus   PrometheusConfig          `yaml:"prometheus"`
 	LogLevel     string                    `yaml:"logLevel"`
 	LogFormat    string                    `yaml:"logFormat"`
-	Port         uint16                    `yaml:"port"`
+	LogTimestamp bool                      `yaml:"logTimestamp"`
+	Port         string                    `yaml:"port"`
 	HTTPPort     uint16                    `yaml:"httpPort"`
 	HTTPSPort    uint16                    `yaml:"httpsPort"`
+	DisableIPv6  bool                      `yaml:"disableIPv6"`
 	CertFile     string                    `yaml:"httpsCertFile"`
 	KeyFile      string                    `yaml:"httpsKeyFile"`
 	BootstrapDNS Upstream                  `yaml:"bootstrapDns"`
@@ -179,18 +225,33 @@ type PrometheusConfig struct {
 	Path   string `yaml:"path"`
 }
 
+// UpstreamConfig upstream server configuration
 type UpstreamConfig struct {
-	ExternalResolvers []Upstream `yaml:"externalResolvers"`
+	ExternalResolvers map[string][]Upstream `yaml:",inline"`
 }
 
+// CustomDNSConfig custom DNS configuration
 type CustomDNSConfig struct {
-	Mapping map[string]net.IP `yaml:"mapping"`
+	Mapping CustomDNSMapping `yaml:"mapping"`
 }
 
+// CustomDNSMapping mapping for the custom DNS configuration
+type CustomDNSMapping struct {
+	HostIPs map[string][]net.IP
+}
+
+// ConditionalUpstreamConfig conditional upstream configuration
 type ConditionalUpstreamConfig struct {
-	Mapping map[string]Upstream `yaml:"mapping"`
+	Rewrite map[string]string          `yaml:"rewrite"`
+	Mapping ConditionalUpstreamMapping `yaml:"mapping"`
 }
 
+// ConditionalUpstreamMapping mapping for conditional configuration
+type ConditionalUpstreamMapping struct {
+	Upstreams map[string][]Upstream
+}
+
+// BlockingConfig configuration for query blocking
 type BlockingConfig struct {
 	BlackLists        map[string][]string `yaml:"blackLists"`
 	WhiteLists        map[string][]string `yaml:"whiteLists"`
@@ -199,40 +260,51 @@ type BlockingConfig struct {
 	RefreshPeriod     int                 `yaml:"refreshPeriod"`
 }
 
+// ClientLookupConfig configuration for the client lookup
 type ClientLookupConfig struct {
 	ClientnameIPMapping map[string][]net.IP `yaml:"clients"`
 	Upstream            Upstream            `yaml:"upstream"`
 	SingleNameOrder     []uint              `yaml:"singleNameOrder"`
 }
 
+// CachingConfig configuration for domain caching
 type CachingConfig struct {
-	MinCachingTime int `yaml:"minTime"`
-	MaxCachingTime int `yaml:"maxTime"`
+	MinCachingTime int  `yaml:"minTime"`
+	MaxCachingTime int  `yaml:"maxTime"`
+	Prefetching    bool `yaml:"prefetching"`
 }
 
+// QueryLogConfig configuration for the query logging
 type QueryLogConfig struct {
 	Dir              string `yaml:"dir"`
 	PerClient        bool   `yaml:"perClient"`
 	LogRetentionDays uint64 `yaml:"logRetentionDays"`
 }
 
-func NewConfig(path string) Config {
+// NewConfig creates new config from YAML file
+func NewConfig(path string, mandatory bool) Config {
 	cfg := Config{}
 	setDefaultValues(&cfg)
 
 	data, err := ioutil.ReadFile(path)
 
 	if err != nil {
-		log.Fatal("Can't read config file: ", err)
+		if errors.Is(err, os.ErrNotExist) && !mandatory {
+			// config file does not exist
+			// return config with default values
+			return cfg
+		}
+
+		log.Log().Fatal("Can't read config file: ", err)
 	}
 
 	err = yaml.UnmarshalStrict(data, &cfg)
 	if err != nil {
-		log.Fatal("wrong file structure: ", err)
+		log.Log().Fatal("wrong file structure: ", err)
 	}
 
-	if cfg.LogFormat != CfgLogFormatText && cfg.LogFormat != CfgLogFormatJSON {
-		log.Fatal("LogFormat should be 'text' or 'json'")
+	if cfg.LogFormat != log.CfgLogFormatText && cfg.LogFormat != log.CfgLogFormatJSON {
+		log.Log().Fatal("LogFormat should be 'text' or 'json'")
 	}
 
 	return cfg
@@ -241,6 +313,7 @@ func NewConfig(path string) Config {
 func setDefaultValues(cfg *Config) {
 	cfg.Port = cfgDefaultPort
 	cfg.LogLevel = "info"
-	cfg.LogFormat = CfgLogFormatText
+	cfg.LogFormat = log.CfgLogFormatText
+	cfg.LogTimestamp = true
 	cfg.Prometheus.Path = cfgDefaultPrometheusPath
 }

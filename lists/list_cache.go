@@ -1,8 +1,10 @@
 package lists
 
 import (
-	"blocky/metrics"
+	"blocky/evt"
+	"blocky/util"
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,7 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"blocky/log"
+
 	"github.com/sirupsen/logrus"
 )
 
@@ -21,13 +24,14 @@ const (
 	defaultRefreshPeriod = 4 * time.Hour
 )
 
-// nolint:gochecknoglobals
-var timeout = 30 * time.Second
-
+// ListCacheType represents the type of a cached list
 type ListCacheType int
 
 const (
+	// BLACKLIST is a list with blocked domains / IPs
 	BLACKLIST ListCacheType = iota
+
+	// WHITELIST is a list with whitelisted domains / IPs
 	WHITELIST
 )
 
@@ -39,24 +43,59 @@ func (l ListCacheType) String() string {
 	return names[l]
 }
 
+// nolint:gochecknoglobals
+var timeout = 60 * time.Second
+
+type stringCache map[int]string
+
+func (cache stringCache) elementCount() int {
+	count := 0
+
+	for k, v := range cache {
+		count += len(v) / k
+	}
+
+	return count
+}
+
+func (cache stringCache) contains(searchString string) bool {
+	searchLen := len(searchString)
+	if searchLen == 0 {
+		return false
+	}
+
+	searchBucketLen := len(cache[searchLen]) / searchLen
+	idx := sort.Search(searchBucketLen, func(i int) bool {
+		return cache[searchLen][i*searchLen:i*searchLen+searchLen] >= searchString
+	})
+
+	if idx < searchBucketLen {
+		return cache[searchLen][idx*searchLen:idx*searchLen+searchLen] == strings.ToLower(searchString)
+	}
+
+	return false
+}
+
+// Matcher checks if a domain is in a list
 type Matcher interface {
-	// matches passed domain name against cached list entries
+	// Match matches passed domain name against cached list entries
 	Match(domain string, groupsToCheck []string) (found bool, group string)
 
-	// returns current configuration and stats
+	// Configuration returns current configuration and stats
 	Configuration() []string
 }
 
+// ListCache generic cache of strings divided in groups
 type ListCache struct {
-	groupCaches map[string][]string
+	groupCaches map[string]stringCache
 	lock        sync.RWMutex
 
 	groupToLinks  map[string][]string
 	refreshPeriod time.Duration
-
-	counter *prometheus.GaugeVec
+	listType      ListCacheType
 }
 
+// Configuration returns current configuration and stats
 func (b *ListCache) Configuration() (result []string) {
 	if b.refreshPeriod > 0 {
 		result = append(result, fmt.Sprintf("refresh period: %d minutes", b.refreshPeriod/time.Minute))
@@ -77,8 +116,8 @@ func (b *ListCache) Configuration() (result []string) {
 	var total int
 
 	for group, cache := range b.groupCaches {
-		result = append(result, fmt.Sprintf("  %s: %d entries", group, len(cache)))
-		total += len(cache)
+		result = append(result, fmt.Sprintf("  %s: %d entries", group, cache.elementCount()))
+		total += cache.elementCount()
 	}
 
 	result = append(result, fmt.Sprintf("  TOTAL: %d entries", total))
@@ -86,41 +125,29 @@ func (b *ListCache) Configuration() (result []string) {
 	return
 }
 
+// NewListCache creates new list instance
 func NewListCache(t ListCacheType, groupToLinks map[string][]string, refreshPeriod int) *ListCache {
-	groupCaches := make(map[string][]string)
+	groupCaches := make(map[string]stringCache)
 
 	p := time.Duration(refreshPeriod) * time.Minute
 	if refreshPeriod == 0 {
 		p = defaultRefreshPeriod
 	}
 
-	var counter *prometheus.GaugeVec
-
-	if metrics.IsEnabled() {
-		counter = prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Name: fmt.Sprintf("blocky_%s_cache", t),
-				Help: "Number of entries in cache",
-			}, []string{"group"},
-		)
-
-		metrics.RegisterMetric(counter)
-	}
-
 	b := &ListCache{
 		groupToLinks:  groupToLinks,
 		groupCaches:   groupCaches,
 		refreshPeriod: p,
-		counter:       counter,
+		listType:      t,
 	}
-	b.refresh()
+	b.Refresh()
 
 	go periodicUpdate(b)
 
 	return b
 }
 
-// triggers periodical refresh (and download) of list entries
+// periodicUpdate triggers periodical refresh (and download) of list entries
 func periodicUpdate(cache *ListCache) {
 	if cache.refreshPeriod > 0 {
 		ticker := time.NewTicker(cache.refreshPeriod)
@@ -128,20 +155,20 @@ func periodicUpdate(cache *ListCache) {
 
 		for {
 			<-ticker.C
-			cache.refresh()
+			cache.Refresh()
 		}
 	}
 }
 
 func logger() *logrus.Entry {
-	return logrus.WithField("prefix", "list_cache")
+	return log.PrefixedLog("list_cache")
 }
 
 // downloads and reads files with domain names and creates cache for them
-func createCacheForGroup(links []string) []string {
-	cache := make([]string, 0)
+func createCacheForGroup(links []string) stringCache {
+	cache := make(stringCache)
 
-	keys := make(map[string]bool)
+	keys := make(map[string]struct{})
 
 	var wg sync.WaitGroup
 
@@ -155,6 +182,8 @@ func createCacheForGroup(links []string) []string {
 
 	wg.Wait()
 
+	tmp := make(map[int]*strings.Builder)
+
 Loop:
 	for {
 		select {
@@ -164,8 +193,11 @@ Loop:
 			}
 			for _, entry := range res {
 				if _, value := keys[entry]; !value {
-					keys[entry] = true
-					cache = append(cache, entry)
+					keys[entry] = struct{}{}
+					if tmp[len(entry)] == nil {
+						tmp[len(entry)] = &strings.Builder{}
+					}
+					tmp[len(entry)].WriteString(entry)
 				}
 			}
 		default:
@@ -174,17 +206,25 @@ Loop:
 		}
 	}
 
-	sort.Strings(cache)
+	for k, v := range tmp {
+		chunks := util.Chunks(v.String(), k)
+		sort.Strings(chunks)
+
+		cache[k] = strings.Join(chunks, "")
+
+		v.Reset()
+	}
 
 	return cache
 }
 
+// Match matches passed domain name against cached list entries
 func (b *ListCache) Match(domain string, groupsToCheck []string) (found bool, group string) {
 	b.lock.RLock()
 	defer b.lock.RUnlock()
 
 	for _, g := range groupsToCheck {
-		if contains(domain, b.groupCaches[g]) {
+		if b.groupCaches[g].contains(domain) {
 			return true, g
 		}
 	}
@@ -192,16 +232,8 @@ func (b *ListCache) Match(domain string, groupsToCheck []string) (found bool, gr
 	return false, ""
 }
 
-func contains(domain string, cache []string) bool {
-	idx := sort.SearchStrings(cache, domain)
-	if idx < len(cache) {
-		return cache[idx] == strings.ToLower(domain)
-	}
-
-	return false
-}
-
-func (b *ListCache) refresh() {
+// Refresh triggers the refresh of a list
+func (b *ListCache) Refresh() {
 	for group, links := range b.groupToLinks {
 		cacheForGroup := createCacheForGroup(links)
 
@@ -213,13 +245,11 @@ func (b *ListCache) refresh() {
 			logger().Warn("Populating of group cache failed, leaving items from last successful download in cache")
 		}
 
-		if metrics.IsEnabled() {
-			b.counter.WithLabelValues(group).Set(float64(len(b.groupCaches[group])))
-		}
+		evt.Bus().Publish(evt.BlockingCacheGroupChanged, b.listType, group, b.groupCaches[group].elementCount())
 
 		logger().WithFields(logrus.Fields{
 			"group":       group,
-			"total_count": len(b.groupCaches[group]),
+			"total_count": b.groupCaches[group].elementCount(),
 		}).Info("group import finished")
 	}
 }
@@ -244,14 +274,15 @@ func downloadFile(link string) (io.ReadCloser, error) {
 				return resp.Body, nil
 			}
 
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
-			return nil, fmt.Errorf("couldn't download url, got status code %d", resp.StatusCode)
+			return nil, fmt.Errorf("couldn't download url '%s', got status code %d", link, resp.StatusCode)
 		}
 
-		if errNet, ok := err.(net.Error); ok && (errNet.Timeout() || errNet.Temporary()) {
+		var netErr net.Error
+		if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
 			logger().WithField("link", link).WithField("attempt",
-				attempt).Warnf("Temporary network error / Timeout occurred, retrying... %s", errNet)
+				attempt).Warnf("Temporary network error / Timeout occurred, retrying... %s", netErr)
 			time.Sleep(time.Second)
 			attempt++
 		} else {
@@ -288,7 +319,8 @@ func processFile(link string, ch chan<- []string, wg *sync.WaitGroup) {
 	if err != nil {
 		logger().Warn("error during file processing: ", err)
 
-		if errNet, ok := err.(net.Error); ok && (errNet.Timeout() || errNet.Temporary()) {
+		var netErr net.Error
+		if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
 			// put nil to indicate the temporary error
 			ch <- nil
 			return
@@ -306,8 +338,8 @@ func processFile(link string, ch chan<- []string, wg *sync.WaitGroup) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		// skip comments
-		if !strings.HasPrefix(line, "#") {
-			result = append(result, processLine(line))
+		if line := processLine(line); line != "" {
+			result = append(result, line)
 
 			count++
 		}
@@ -326,7 +358,12 @@ func processFile(link string, ch chan<- []string, wg *sync.WaitGroup) {
 
 // return only first column (see hosts format)
 func processLine(line string) string {
+	if strings.HasPrefix(line, "#") {
+		return ""
+	}
+
 	parts := strings.Fields(line)
+
 	if len(parts) > 0 {
 		host := parts[len(parts)-1]
 

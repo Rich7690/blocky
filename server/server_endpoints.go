@@ -3,7 +3,7 @@ package server
 import (
 	"blocky/api"
 	"blocky/config"
-	"blocky/docs"
+	"blocky/log"
 	"blocky/resolver"
 	"blocky/util"
 	"blocky/web"
@@ -20,8 +20,6 @@ import (
 	"github.com/go-chi/chi/middleware"
 	"github.com/go-chi/cors"
 	"github.com/miekg/dns"
-	"github.com/sirupsen/logrus"
-	httpSwagger "github.com/swaggo/http-swagger"
 )
 
 const (
@@ -30,7 +28,7 @@ const (
 )
 
 func (s *Server) registerAPIEndpoints(router *chi.Mux) {
-	router.Post(api.BlockingQueryPath, s.apiQuery)
+	router.Post(api.PathQueryPath, s.apiQuery)
 
 	router.Get("/dns-query", s.dohGetRequestHandler)
 	router.Post("/dns-query", s.dohPostRequestHandler)
@@ -44,7 +42,7 @@ func (s *Server) dohGetRequestHandler(rw http.ResponseWriter, req *http.Request)
 		return
 	}
 
-	rawMsg, err := base64.StdEncoding.DecodeString(dnsParam[0])
+	rawMsg, err := base64.RawURLEncoding.DecodeString(dnsParam[0])
 	if err != nil {
 		http.Error(rw, "wrong message format", http.StatusBadRequest)
 
@@ -215,8 +213,6 @@ func createRouter(cfg *config.Config) *chi.Mux {
 
 	configureDebugHandler(router)
 
-	configureSwaggerHandler(router)
-
 	configureRootHandler(cfg, router)
 
 	return router
@@ -233,8 +229,8 @@ func configureRootHandler(cfg *config.Config, router *chi.Mux) {
 		}
 		var links = []HandlerLink{
 			{
-				URL:   "/swagger/",
-				Title: "Swagger Rest API Documentation",
+				URL:   "https://htmlpreview.github.io/?https://github.com/0xERR0R/blocky/blob/master/docs/swagger.html",
+				Title: "Swagger Rest API Documentation (Online @GitHub)",
 			},
 			{
 				URL:   "/debug/",
@@ -251,28 +247,9 @@ func configureRootHandler(cfg *config.Config, router *chi.Mux) {
 
 		err := t.Execute(writer, links)
 		if err != nil {
-			logrus.Error("can't write index template: ", err)
+			log.Log().Error("can't write index template: ", err)
 			writer.WriteHeader(http.StatusInternalServerError)
 		}
-	})
-}
-
-func configureSwaggerHandler(router *chi.Mux) {
-	router.Get("/swagger/*", func(writer http.ResponseWriter, request *http.Request) {
-		// set swagger host with host from request
-		docs.SwaggerInfo.Host = request.Host
-		var url func(c *httpSwagger.Config)
-		if request.TLS == nil {
-			url = httpSwagger.URL(fmt.Sprintf("http://%s/swagger/doc.json", request.Host))
-		} else {
-			url = httpSwagger.URL(fmt.Sprintf("https://%s/swagger/doc.json", request.Host))
-		}
-		swaggerHandler := httpSwagger.Handler(url)
-		swaggerHandler.ServeHTTP(writer, request)
-	})
-
-	router.Get("/swagger", func(writer http.ResponseWriter, request *http.Request) {
-		http.Redirect(writer, request, "/swagger/", http.StatusMovedPermanently)
 	})
 }
 

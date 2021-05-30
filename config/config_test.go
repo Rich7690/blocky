@@ -1,6 +1,7 @@
 package config
 
 import (
+	. "blocky/log"
 	"io/ioutil"
 	"net"
 	"os"
@@ -8,8 +9,6 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
-
-	"github.com/sirupsen/logrus"
 )
 
 var _ = Describe("Config", func() {
@@ -19,16 +18,22 @@ var _ = Describe("Config", func() {
 				err := os.Chdir("../testdata")
 				Expect(err).Should(Succeed())
 
-				cfg := NewConfig("config.yml")
+				cfg := NewConfig("config.yml", true)
 
-				Expect(cfg.Port).Should(Equal(uint16(55555)))
-				Expect(cfg.Upstream.ExternalResolvers).Should(HaveLen(3))
-				Expect(cfg.Upstream.ExternalResolvers[0].Host).Should(Equal("8.8.8.8"))
-				Expect(cfg.Upstream.ExternalResolvers[1].Host).Should(Equal("8.8.4.4"))
-				Expect(cfg.Upstream.ExternalResolvers[2].Host).Should(Equal("1.1.1.1"))
-				Expect(cfg.CustomDNS.Mapping).Should(HaveLen(1))
-				Expect(cfg.CustomDNS.Mapping["my.duckdns.org"]).Should(Equal(net.ParseIP("192.168.178.3")))
-				Expect(cfg.Conditional.Mapping).Should(HaveLen(1))
+				Expect(cfg.Port).Should(Equal("55555"))
+				Expect(cfg.Upstream.ExternalResolvers["default"]).Should(HaveLen(3))
+				Expect(cfg.Upstream.ExternalResolvers["default"][0].Host).Should(Equal("8.8.8.8"))
+				Expect(cfg.Upstream.ExternalResolvers["default"][1].Host).Should(Equal("8.8.4.4"))
+				Expect(cfg.Upstream.ExternalResolvers["default"][2].Host).Should(Equal("1.1.1.1"))
+				Expect(cfg.CustomDNS.Mapping.HostIPs).Should(HaveLen(2))
+				Expect(cfg.CustomDNS.Mapping.HostIPs["my.duckdns.org"][0]).Should(Equal(net.ParseIP("192.168.178.3")))
+				Expect(cfg.CustomDNS.Mapping.HostIPs["multiple.ips"][0]).Should(Equal(net.ParseIP("192.168.178.3")))
+				Expect(cfg.CustomDNS.Mapping.HostIPs["multiple.ips"][1]).Should(Equal(net.ParseIP("192.168.178.4")))
+				Expect(cfg.CustomDNS.Mapping.HostIPs["multiple.ips"][2]).Should(Equal(
+					net.ParseIP("2001:0db8:85a3:08d3:1319:8a2e:0370:7344")))
+				Expect(cfg.Conditional.Mapping.Upstreams).Should(HaveLen(2))
+				Expect(cfg.Conditional.Mapping.Upstreams["fritz.box"]).Should(HaveLen(1))
+				Expect(cfg.Conditional.Mapping.Upstreams["multiple.resolvers"]).Should(HaveLen(2))
 				Expect(cfg.ClientLookup.Upstream.Host).Should(Equal("192.168.178.1"))
 				Expect(cfg.ClientLookup.SingleNameOrder).Should(Equal([]uint{2, 1}))
 				Expect(cfg.Blocking.BlackLists).Should(HaveLen(2))
@@ -47,32 +52,41 @@ var _ = Describe("Config", func() {
 				Expect(err).Should(Succeed())
 				err = os.Chdir(dir)
 				Expect(err).Should(Succeed())
-				err = ioutil.WriteFile("config.yml", []byte("malformed_config"), 0644)
+				err = ioutil.WriteFile("config.yml", []byte("malformed_config"), 0600)
 				Expect(err).Should(Succeed())
 
-				defer func() { logrus.StandardLogger().ExitFunc = nil }()
+				defer func() { Log().ExitFunc = nil }()
 
 				var fatal bool
 
-				logrus.StandardLogger().ExitFunc = func(int) { fatal = true }
+				Log().ExitFunc = func(int) { fatal = true }
 
-				_ = NewConfig("config.yml")
+				_ = NewConfig("config.yml", true)
 				Expect(fatal).Should(BeTrue())
 			})
 		})
 		When("config directory does not exist", func() {
-			It("should log with fatal and exit", func() {
+			It("should log with fatal and exit if config is mandatory", func() {
 				err := os.Chdir("../..")
 				Expect(err).Should(Succeed())
 
-				defer func() { logrus.StandardLogger().ExitFunc = nil }()
+				defer func() { Log().ExitFunc = nil }()
 
 				var fatal bool
 
-				logrus.StandardLogger().ExitFunc = func(int) { fatal = true }
-				_ = NewConfig("config.yml")
+				Log().ExitFunc = func(int) { fatal = true }
+				_ = NewConfig("config.yml", true)
 
 				Expect(fatal).Should(BeTrue())
+			})
+
+			It("should use default config if config is not mandatory", func() {
+				err := os.Chdir("../..")
+				Expect(err).Should(Succeed())
+
+				cfg := NewConfig("config.yml", false)
+
+				Expect(cfg.LogLevel).Should(Equal("info"))
 			})
 		})
 	})
@@ -133,7 +147,11 @@ var _ = Describe("Config", func() {
 			false),
 		Entry("udpIpv6WithPort",
 			"udp:[fd00::6cd4:d7e0:d99d:2952]:53",
-			Upstream{Net: "tcp+udp", Host: "[fd00::6cd4:d7e0:d99d:2952]", Port: 53},
+			Upstream{Net: "tcp+udp", Host: "fd00::6cd4:d7e0:d99d:2952", Port: 53},
+			false),
+		Entry("udpIpv6WithPort2",
+			"udp://[2001:4860:4860::8888]:53",
+			Upstream{Net: "tcp+udp", Host: "2001:4860:4860::8888", Port: 53},
 			false),
 		Entry("default net, default port",
 			"1.1.1.1",

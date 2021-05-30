@@ -74,21 +74,24 @@ func createUpstreamClient(cfg config.Upstream) (client upstreamClient, upstreamU
 }
 
 func (r *httpUpstreamClient) callExternal(msg *dns.Msg,
-	upstreamURL string, protocol RequestProtocol) (*dns.Msg, time.Duration, error) {
+	upstreamURL string, _ RequestProtocol) (*dns.Msg, time.Duration, error) {
 	start := time.Now()
 
 	rawDNSMessage, err := msg.Pack()
 
 	if err != nil {
-		return nil, 0, fmt.Errorf("can't pack message: %v", err)
+		return nil, 0, fmt.Errorf("can't pack message: %w", err)
 	}
 
 	httpResponse, err := r.client.Post(upstreamURL, dnsContentType, bytes.NewReader(rawDNSMessage))
 
 	if err != nil {
-		return nil, 0, fmt.Errorf("can't perform https request: %v", err)
+		return nil, 0, fmt.Errorf("can't perform https request: %w", err)
 	}
-	defer httpResponse.Body.Close()
+
+	defer func() {
+		util.LogOnError("cant close response body ", httpResponse.Body.Close())
+	}()
 
 	if httpResponse.StatusCode != http.StatusOK {
 		return nil, 0, fmt.Errorf("http return code should be %d, but received %d", http.StatusOK, httpResponse.StatusCode)
@@ -121,8 +124,9 @@ func (r *dnsUpstreamClient) callExternal(msg *dns.Msg,
 		response, rtt, err = r.tcpClient.Exchange(msg, upstreamURL)
 		if err != nil {
 			// try UDP as fallback
-			if t, ok := err.(*net.OpError); ok {
-				if t.Op == "dial" {
+			var opErr *net.OpError
+			if errors.As(err, &opErr) {
+				if opErr.Op == "dial" && r.udpClient != nil {
 					return r.udpClient.Exchange(msg, upstreamURL)
 				}
 			}
@@ -138,6 +142,7 @@ func (r *dnsUpstreamClient) callExternal(msg *dns.Msg,
 	return r.tcpClient.Exchange(msg, upstreamURL)
 }
 
+// NewUpstreamResolver creates new resolver instance
 func NewUpstreamResolver(upstream config.Upstream) *UpstreamResolver {
 	upstreamClient, upstreamURL := createUpstreamClient(upstream)
 
@@ -147,6 +152,7 @@ func NewUpstreamResolver(upstream config.Upstream) *UpstreamResolver {
 		net:            upstream.Net}
 }
 
+// Configuration return current resolver configuration
 func (r *UpstreamResolver) Configuration() (result []string) {
 	return
 }
@@ -155,6 +161,7 @@ func (r UpstreamResolver) String() string {
 	return fmt.Sprintf("upstream '%s:%s'", r.net, r.upstreamURL)
 }
 
+// Resolve calls external resolver
 func (r *UpstreamResolver) Resolve(request *Request) (response *Response, err error) {
 	logger := withPrefix(request.Log, "upstream_resolver")
 
@@ -175,10 +182,11 @@ func (r *UpstreamResolver) Resolve(request *Request) (response *Response, err er
 				"response_time_ms": rtt.Milliseconds(),
 			}).Debugf("received response from upstream")
 
-			return &Response{Res: resp, Reason: fmt.Sprintf("RESOLVED (%s)", r.upstreamURL)}, err
+			return &Response{Res: resp, Reason: fmt.Sprintf("RESOLVED (%s)", r.upstreamURL)}, nil
 		}
 
-		if errNet, ok := err.(net.Error); ok && (errNet.Timeout() || errNet.Temporary()) {
+		var netErr net.Error
+		if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) {
 			logger.WithField("attempt", attempt).Debugf("Temporary network error / Timeout occurred, retrying...")
 			attempt++
 		} else {

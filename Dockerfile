@@ -1,5 +1,5 @@
 # build stage
-FROM golang:1.14-alpine AS build-env
+FROM golang:1.16-alpine AS build-env
 RUN apk add --no-cache \
     git \
     make \
@@ -14,20 +14,23 @@ ENV GO111MODULE=on \
     
 WORKDIR /src
 
-COPY go.mod .
-COPY go.sum .
+COPY go.mod go.sum ./
 RUN go mod download
 
 # add source
 ADD . .
 
 ARG opts
-RUN make tools
 RUN env ${opts} make build
 
 # final stage
-FROM alpine
-RUN apk add --no-cache bind-tools
+FROM alpine:3.12
+
+LABEL org.opencontainers.image.source="https://github.com/0xERR0R/blocky" \
+      org.opencontainers.image.url="https://github.com/0xERR0R/blocky" \
+      org.opencontainers.image.title="DNS proxy as ad-blocker for local network"
+
+RUN apk add --no-cache bind-tools tini
 COPY --from=build-env /src/bin/blocky /app/blocky
 
 # the timezone data:
@@ -39,4 +42,5 @@ HEALTHCHECK --interval=1m --timeout=3s CMD dig @127.0.0.1 -p 53 healthcheck.bloc
 
 WORKDIR /app
 
-ENTRYPOINT ["/app/blocky","--config","/app/config.yml"]
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["/app/blocky","--config","/app/config.yml"]

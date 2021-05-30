@@ -3,23 +3,20 @@ package resolver
 import (
 	"blocky/api"
 	"blocky/config"
+	"blocky/evt"
 	"blocky/lists"
-	"blocky/metrics"
 	"blocky/util"
-	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi"
+	"blocky/log"
+
 	"github.com/miekg/dns"
-	"github.com/prometheus/client_golang/prometheus"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 )
 
 func createBlockHandler(cfg config.BlockingConfig) blockHandler {
@@ -47,76 +44,37 @@ func createBlockHandler(cfg config.BlockingConfig) blockHandler {
 		}
 	}
 
-	log.Fatalf("unknown blockType, please use one of: ZeroIP, NxDomain or specify destination IP address(es)")
+	log.Log().Fatalf("unknown blockType, please use one of: ZeroIP, NxDomain or specify destination IP address(es)")
 
 	return zeroIPBlockHandler{}
 }
 
 type status struct {
-	enabled      bool
-	enabledGauge prometheus.Gauge
-	enableTimer  *time.Timer
-	disableEnd   time.Time
+	// true: blocking of all groups is enabled
+	// false: blocking is disabled. Either all groups or only particular
+	enabled        bool
+	disabledGroups []string
+	enableTimer    *time.Timer
+	disableEnd     time.Time
 }
 
-func (s *status) enableBlocking() {
-	s.enableTimer.Stop()
-	s.enabled = true
-
-	if metrics.IsEnabled() {
-		s.enabledGauge.Set(1)
-	}
-}
-
-func (s *status) disableBlocking(duration time.Duration) {
-	s.enableTimer.Stop()
-	s.enabled = false
-
-	if metrics.IsEnabled() {
-		s.enabledGauge.Set(0)
-	}
-
-	s.disableEnd = time.Now().Add(duration)
-
-	if duration == 0 {
-		log.Info("disable blocking")
-	} else {
-		log.Infof("disable blocking for %s", duration)
-		s.enableTimer = time.AfterFunc(duration, func() {
-			s.enableBlocking()
-			log.Info("blocking enabled again")
-		})
-	}
-}
-
-// checks request's question (domain name) against black and white lists
+// BlockingResolver checks request's question (domain name) against black and white lists
 type BlockingResolver struct {
 	NextResolver
-	blacklistMatcher    lists.Matcher
-	whitelistMatcher    lists.Matcher
+	blacklistMatcher    *lists.ListCache
+	whitelistMatcher    *lists.ListCache
 	cfg                 config.BlockingConfig
 	blockHandler        blockHandler
 	whitelistOnlyGroups []string
-	status              status
+	status              *status
 }
 
-func NewBlockingResolver(router *chi.Mux, cfg config.BlockingConfig) ChainedResolver {
+// NewBlockingResolver returns a new configured instance of the resolver
+func NewBlockingResolver(cfg config.BlockingConfig) ChainedResolver {
 	blockHandler := createBlockHandler(cfg)
 	blacklistMatcher := lists.NewListCache(lists.BLACKLIST, cfg.BlackLists, cfg.RefreshPeriod)
 	whitelistMatcher := lists.NewListCache(lists.WHITELIST, cfg.WhiteLists, cfg.RefreshPeriod)
 	whitelistOnlyGroups := determineWhitelistOnlyGroups(&cfg)
-
-	var enabledGauge prometheus.Gauge
-
-	if metrics.IsEnabled() {
-		enabledGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "blocky_blocking_enabled",
-			Help: "Blockings status",
-		})
-		enabledGauge.Set(1)
-
-		metrics.RegisterMetric(enabledGauge)
-	}
 
 	res := &BlockingResolver{
 		blockHandler:        blockHandler,
@@ -124,83 +82,98 @@ func NewBlockingResolver(router *chi.Mux, cfg config.BlockingConfig) ChainedReso
 		blacklistMatcher:    blacklistMatcher,
 		whitelistMatcher:    whitelistMatcher,
 		whitelistOnlyGroups: whitelistOnlyGroups,
-		status: status{
-			enabledGauge: enabledGauge,
-			enabled:      true,
-			enableTimer:  time.NewTimer(0),
+		status: &status{
+			enabled:     true,
+			enableTimer: time.NewTimer(0),
 		},
 	}
-
-	// register API endpoints
-	router.Get(api.BlockingEnablePath, res.apiBlockingEnable)
-	router.Get(api.BlockingDisablePath, res.apiBlockingDisable)
-	router.Get(api.BlockingStatusPath, res.apiBlockingStatus)
 
 	return res
 }
 
-// apiBlockingEnable is the http endpoint to enable the blocking status
-// @Summary Enable blocking
-// @Description enable the blocking status
-// @Tags blocking
-// @Success 200   "Blocking is enabled"
-// @Router /blocking/enable [get]
-func (r *BlockingResolver) apiBlockingEnable(_ http.ResponseWriter, _ *http.Request) {
-	log.Info("enabling blocking...")
-	r.status.enableBlocking()
+// RefreshLists triggers the refresh of all black and white lists in the cache
+func (r *BlockingResolver) RefreshLists() {
+	r.blacklistMatcher.Refresh()
+	r.whitelistMatcher.Refresh()
 }
 
-// apiBlockingStatus is the http endpoint to get current blocking status
-// @Summary Blocking status
-// @Description get current blocking status
-// @Tags blocking
-// @Produce  json
-// @Success 200 {object} api.BlockingStatus "Returns current blocking status"
-// @Router /blocking/status [get]
-func (r *BlockingResolver) apiBlockingStatus(rw http.ResponseWriter, _ *http.Request) {
+// nolint:prealloc
+func (r *BlockingResolver) retrieveAllBlockingGroups() []string {
+	groups := make(map[string]bool)
+
+	for group := range r.cfg.BlackLists {
+		groups[group] = true
+	}
+
+	var result []string
+	for k := range groups {
+		result = append(result, k)
+	}
+
+	result = append(result, "default")
+	sort.Strings(result)
+
+	return result
+}
+
+// EnableBlocking enables the blocking against the blacklists
+func (r *BlockingResolver) EnableBlocking() {
+	s := r.status
+	s.enableTimer.Stop()
+	s.enabled = true
+	s.disabledGroups = []string{}
+
+	evt.Bus().Publish(evt.BlockingEnabledEvent, true)
+}
+
+// DisableBlocking deactivates the blocking for a particular duration (or forever if 0).
+func (r *BlockingResolver) DisableBlocking(duration time.Duration, disableGroups []string) error {
+	s := r.status
+	s.enableTimer.Stop()
+	s.enabled = false
+	allBlockingGroups := r.retrieveAllBlockingGroups()
+
+	if len(disableGroups) == 0 {
+		s.disabledGroups = allBlockingGroups
+	} else {
+		for _, g := range disableGroups {
+			i := sort.SearchStrings(allBlockingGroups, g)
+			if !(i < len(allBlockingGroups) && allBlockingGroups[i] == g) {
+				return fmt.Errorf("group '%s' is unknown", g)
+			}
+		}
+		s.disabledGroups = disableGroups
+	}
+
+	evt.Bus().Publish(evt.BlockingEnabledEvent, false)
+
+	s.disableEnd = time.Now().Add(duration)
+
+	if duration == 0 {
+		log.Log().Infof("disable blocking for group(s) '%s'", strings.Join(s.disabledGroups, "; "))
+	} else {
+		log.Log().Infof("disable blocking for %s for group(s) '%s'", duration, strings.Join(s.disabledGroups, "; "))
+		s.enableTimer = time.AfterFunc(duration, func() {
+			r.EnableBlocking()
+			log.Log().Info("blocking enabled again")
+		})
+	}
+
+	return nil
+}
+
+// BlockingStatus returns the current blocking status
+func (r *BlockingResolver) BlockingStatus() api.BlockingStatus {
 	var autoEnableDuration time.Duration
 	if !r.status.enabled && r.status.disableEnd.After(time.Now()) {
 		autoEnableDuration = time.Until(r.status.disableEnd)
 	}
 
-	response, _ := json.Marshal(api.BlockingStatus{
+	return api.BlockingStatus{
 		Enabled:         r.status.enabled,
+		DisabledGroups:  r.status.disabledGroups,
 		AutoEnableInSec: uint(autoEnableDuration.Seconds()),
-	})
-	_, err := rw.Write(response)
-
-	if err != nil {
-		log.Fatal("unable to write response ", err)
 	}
-}
-
-// apiBlockingDisable is the http endpoint to disable the blocking status
-// @Summary Disable blocking
-// @Description disable the blocking status
-// @Tags blocking
-// @Param duration query string false "duration of blocking (Example: 300s, 5m, 1h, 5m30s)" Format(duration)
-// @Success 200   "Blocking is disabled"
-// @Failure 400   "Wrong duration format"
-// @Router /blocking/disable [get]
-func (r *BlockingResolver) apiBlockingDisable(rw http.ResponseWriter, req *http.Request) {
-	var (
-		duration time.Duration
-		err      error
-	)
-
-	// parse duration from query parameter
-	durationParam := req.URL.Query().Get("duration")
-	if len(durationParam) > 0 {
-		duration, err = time.ParseDuration(durationParam)
-		if err != nil {
-			log.Errorf("wrong duration format '%s'", durationParam)
-			rw.WriteHeader(http.StatusBadRequest)
-
-			return
-		}
-	}
-
-	r.status.disableBlocking(duration)
 }
 
 // returns groups, which have only whitelist entries
@@ -219,7 +192,7 @@ func determineWhitelistOnlyGroups(cfg *config.BlockingConfig) (result []string) 
 }
 
 // sets answer and/or return code for DNS response, if request should be blocked
-func (r *BlockingResolver) handleBlocked(logger *log.Entry,
+func (r *BlockingResolver) handleBlocked(logger *logrus.Entry,
 	request *Request, question dns.Question, reason string) (*Response, error) {
 	response := new(dns.Msg)
 	response.SetReply(request.Req)
@@ -231,6 +204,7 @@ func (r *BlockingResolver) handleBlocked(logger *log.Entry,
 	return &Response{Res: response, RType: BLOCKED, Reason: reason}, nil
 }
 
+// Configuration returns the current resolver configuration
 func (r *BlockingResolver) Configuration() (result []string) {
 	if len(r.cfg.ClientGroupsBlock) > 0 {
 		result = append(result, "clientGroupsBlock")
@@ -256,20 +230,12 @@ func (r *BlockingResolver) Configuration() (result []string) {
 	return
 }
 
-func shouldHandle(question dns.Question) bool {
-	return question.Qtype == dns.TypeA || question.Qtype == dns.TypeAAAA
-}
-
 func (r *BlockingResolver) handleBlacklist(groupsToCheck []string,
-	request *Request, logger *log.Entry) (*Response, error) {
+	request *Request, logger *logrus.Entry) (*Response, error) {
 	logger.WithField("groupsToCheck", strings.Join(groupsToCheck, "; ")).Debug("checking groups for request")
 	whitelistOnlyAllowed := reflect.DeepEqual(groupsToCheck, r.whitelistOnlyGroups)
 
 	for _, question := range request.Req.Question {
-		if !shouldHandle(question) {
-			return r.next.Resolve(request)
-		}
-
 		domain := util.ExtractDomain(question)
 		logger := logger.WithField("domain", domain)
 
@@ -290,11 +256,12 @@ func (r *BlockingResolver) handleBlacklist(groupsToCheck []string,
 	return nil, nil
 }
 
+// Resolve checks the query against the blacklist and delegates to next resolver if domain is not blocked
 func (r *BlockingResolver) Resolve(request *Request) (*Response, error) {
 	logger := withPrefix(request.Log, "blacklist_resolver")
 	groupsToCheck := r.groupsToCheckForClient(request)
 
-	if r.status.enabled && len(groupsToCheck) > 0 {
+	if len(groupsToCheck) > 0 {
 		resp, err := r.handleBlacklist(groupsToCheck, request, logger)
 		if resp != nil || err != nil {
 			return resp, err
@@ -303,7 +270,7 @@ func (r *BlockingResolver) Resolve(request *Request) (*Response, error) {
 
 	respFromNext, err := r.next.Resolve(request)
 
-	if err == nil && r.status.enabled && len(groupsToCheck) > 0 && respFromNext.Res != nil {
+	if err == nil && len(groupsToCheck) > 0 && respFromNext.Res != nil {
 		for _, rr := range respFromNext.Res.Answer {
 			entryToCheck, tName := extractEntryToCheckFromResponse(rr)
 			if len(entryToCheck) > 0 {
@@ -337,12 +304,23 @@ func extractEntryToCheckFromResponse(rr dns.RR) (entryToCheck string, tName stri
 	return
 }
 
+func (r *BlockingResolver) isGroupDisabled(group string) bool {
+	for _, g := range r.status.disabledGroups {
+		if g == group {
+			return true
+		}
+	}
+
+	return false
+}
+
 // returns groups which should be checked for client's request
-func (r *BlockingResolver) groupsToCheckForClient(request *Request) (groups []string) {
+func (r *BlockingResolver) groupsToCheckForClient(request *Request) []string {
+	var groups []string
 	// try client names
 	for _, cName := range request.ClientNames {
 		for blockGroup, groupsByName := range r.cfg.ClientGroupsBlock {
-			if clientNameMatchesBlockGroup(blockGroup, cName) {
+			if util.ClientNameMatchesGroupName(blockGroup, cName) {
 				groups = append(groups, groupsByName...)
 			}
 		}
@@ -357,35 +335,27 @@ func (r *BlockingResolver) groupsToCheckForClient(request *Request) (groups []st
 
 	// try CIDR
 	for cidr, groupsByCidr := range r.cfg.ClientGroupsBlock {
-		if cidrContainsIP(cidr, request.ClientIP) {
+		if util.CidrContainsIP(cidr, request.ClientIP) {
 			groups = append(groups, groupsByCidr...)
 		}
 	}
 
 	if len(groups) == 0 {
-		if !found {
-			// return default
-			groups = r.cfg.ClientGroupsBlock["default"]
+		// return default
+		groups = r.cfg.ClientGroupsBlock["default"]
+	}
+
+	var result []string
+
+	for _, g := range groups {
+		if !r.isGroupDisabled(g) {
+			result = append(result, g)
 		}
 	}
 
-	sort.Strings(groups)
+	sort.Strings(result)
 
-	return groups
-}
-
-func cidrContainsIP(cidr string, ip net.IP) bool {
-	_, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return false
-	}
-
-	return ipnet.Contains(ip)
-}
-
-func clientNameMatchesBlockGroup(group string, clientName string) bool {
-	match, _ := filepath.Match(group, clientName)
-	return match
+	return result
 }
 
 func (r *BlockingResolver) matches(groupsToCheck []string, m lists.Matcher,
@@ -423,23 +393,28 @@ func (b zeroIPBlockHandler) handleBlock(question dns.Question, response *dns.Msg
 	switch question.Qtype {
 	case dns.TypeAAAA:
 		zeroIP = net.IPv6zero
-	default:
+	case dns.TypeA:
 		zeroIP = net.IPv4zero
+	default:
+		response.Rcode = dns.RcodeNameError
+		return
 	}
 
-	rr := util.CreateAnswerFromQuestion(question, zeroIP, blockTTL)
+	rr, _ := util.CreateAnswerFromQuestion(question, zeroIP, blockTTL)
 
 	response.Answer = append(response.Answer, rr)
 }
 
-func (b nxDomainBlockHandler) handleBlock(question dns.Question, response *dns.Msg) {
+func (b nxDomainBlockHandler) handleBlock(_ dns.Question, response *dns.Msg) {
 	response.Rcode = dns.RcodeNameError
 }
 
 func (b ipBlockHandler) handleBlock(question dns.Question, response *dns.Msg) {
 	for _, ip := range b.destinations {
+		answer, _ := util.CreateAnswerFromQuestion(question, ip, blockTTL)
+
 		if (question.Qtype == dns.TypeAAAA && ip.To4() == nil) || (question.Qtype == dns.TypeA && ip.To4() != nil) {
-			response.Answer = append(response.Answer, util.CreateAnswerFromQuestion(question, ip, blockTTL))
+			response.Answer = append(response.Answer, answer)
 		}
 	}
 

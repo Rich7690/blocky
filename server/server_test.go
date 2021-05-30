@@ -4,13 +4,13 @@ import (
 	"blocky/api"
 	"blocky/config"
 	. "blocky/helpertest"
+	. "blocky/log"
 	"blocky/resolver"
 	"blocky/util"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -20,7 +20,6 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/miekg/dns"
-	"github.com/sirupsen/logrus"
 )
 
 var _ = Describe("Running DNS server", func() {
@@ -59,13 +58,20 @@ var _ = Describe("Running DNS server", func() {
 		// create server
 		sut, err = NewServer(&config.Config{
 			CustomDNS: config.CustomDNSConfig{
-				Mapping: map[string]net.IP{
-					"custom.lan": net.ParseIP("192.168.178.55"),
-					"lan.home":   net.ParseIP("192.168.178.56"),
+				Mapping: config.CustomDNSMapping{
+					HostIPs: map[string][]net.IP{
+						"custom.lan": {net.ParseIP("192.168.178.55")},
+						"lan.home":   {net.ParseIP("192.168.178.56")},
+					},
 				},
 			},
 			Conditional: config.ConditionalUpstreamConfig{
-				Mapping: map[string]config.Upstream{"fritz.box": upstreamFritzbox},
+				Mapping: config.ConditionalUpstreamMapping{
+					Upstreams: map[string][]config.Upstream{
+						"net.cn":    {upstreamClient},
+						"fritz.box": {upstreamFritzbox},
+					},
+				},
 			},
 			Blocking: config.BlockingConfig{
 				BlackLists: map[string][]string{
@@ -86,14 +92,15 @@ var _ = Describe("Running DNS server", func() {
 				},
 			},
 			Upstream: config.UpstreamConfig{
-				ExternalResolvers: []config.Upstream{upstreamGoogle},
+				ExternalResolvers: map[string][]config.Upstream{"default": {upstreamGoogle}},
 			},
 			ClientLookup: config.ClientLookupConfig{
 				Upstream: upstreamClient,
 			},
 
-			Port:     55555,
+			Port:     "55555",
 			HTTPPort: 4000,
+			LogLevel: "info",
 			Prometheus: config.PrometheusConfig{
 				Enable: true,
 				Path:   "/metrics",
@@ -161,6 +168,13 @@ var _ = Describe("Running DNS server", func() {
 				resp = requestServer(util.NewMsgWithQuestion("host.fritz.box.", dns.TypeA))
 
 				Expect(resp.Answer).Should(BeDNSRecord("host.fritz.box.", dns.TypeA, 3600, "192.168.178.2"))
+			})
+		})
+		Context("Conditional upstream blocking", func() {
+			It("Query should be blocked, domain is in default group", func() {
+				resp = requestServer(util.NewMsgWithQuestion("doubleclick.net.cn.", dns.TypeA))
+
+				Expect(resp.Answer).Should(BeDNSRecord("doubleclick.net.cn.", dns.TypeA, 21600, "0.0.0.0"))
 			})
 		})
 		Context("Blocking default group", func() {
@@ -245,22 +259,6 @@ var _ = Describe("Running DNS server", func() {
 
 	})
 
-	Describe("Swagger endpoint", func() {
-		When("Swagger URL is called", func() {
-			It("should serve swagger page", func() {
-				r, err := http.Get("http://localhost:4000/swagger/")
-				Expect(err).Should(Succeed())
-				Expect(r.StatusCode).Should(Equal(http.StatusOK))
-			})
-		})
-		When("Swagger without trailing slash is called", func() {
-			It("should redirect to swagger URL", func() {
-				r, err := http.Get("http://localhost:4000/swagger")
-				Expect(err).Should(Succeed())
-				Expect(r.StatusCode).Should(Equal(http.StatusOK))
-			})
-		})
-	})
 	Describe("Prometheus endpoint", func() {
 		When("Prometheus URL is called", func() {
 			It("should return prometheus data", func() {
@@ -466,22 +464,26 @@ var _ = Describe("Running DNS server", func() {
 	Describe("Server start", func() {
 		When("Server start is called", func() {
 			It("start was called 2 times, start should fail", func() {
-				defer func() { logrus.StandardLogger().ExitFunc = nil }()
+				defer func() { Log().ExitFunc = nil }()
 
 				var fatal bool
 
-				logrus.StandardLogger().ExitFunc = func(int) { fatal = true }
+				Log().ExitFunc = func(int) { fatal = true }
 
 				// create server
 				server, err := NewServer(&config.Config{
+					Upstream: config.UpstreamConfig{
+						ExternalResolvers: map[string][]config.Upstream{
+							"default": {config.Upstream{Net: "tcp+udp", Host: "4.4.4.4", Port: 53}}}},
 					CustomDNS: config.CustomDNSConfig{
-						Mapping: map[string]net.IP{
-							"custom.lan": net.ParseIP("192.168.178.55"),
-							"lan.home":   net.ParseIP("192.168.178.56"),
-						},
-					},
-
-					Port: 55556,
+						Mapping: config.CustomDNSMapping{
+							HostIPs: map[string][]net.IP{
+								"custom.lan": {net.ParseIP("192.168.178.55")},
+								"lan.home":   {net.ParseIP("192.168.178.56")},
+							},
+						}},
+					Port:     ":55556",
+					LogLevel: "info",
 				})
 
 				Expect(err).Should(Succeed())
@@ -509,22 +511,27 @@ var _ = Describe("Running DNS server", func() {
 	Describe("Server stop", func() {
 		When("Stop is called", func() {
 			It("stop was called 2 times, start should fail", func() {
-				defer func() { logrus.StandardLogger().ExitFunc = nil }()
+				defer func() { Log().ExitFunc = nil }()
 
 				var fatal bool
 
-				logrus.StandardLogger().ExitFunc = func(int) { fatal = true }
+				Log().ExitFunc = func(int) { fatal = true }
 
 				// create server
 				server, err := NewServer(&config.Config{
+					Upstream: config.UpstreamConfig{
+						ExternalResolvers: map[string][]config.Upstream{
+							"default": {config.Upstream{Net: "tcp+udp", Host: "4.4.4.4", Port: 53}}}},
 					CustomDNS: config.CustomDNSConfig{
-						Mapping: map[string]net.IP{
-							"custom.lan": net.ParseIP("192.168.178.55"),
-							"lan.home":   net.ParseIP("192.168.178.56"),
-						},
-					},
+						Mapping: config.CustomDNSMapping{
+							HostIPs: map[string][]net.IP{
+								"custom.lan": {net.ParseIP("192.168.178.55")},
+								"lan.home":   {net.ParseIP("192.168.178.56")},
+							},
+						}},
 
-					Port: 55557,
+					Port:     "127.0.0.1:55557",
+					LogLevel: "info",
 				})
 
 				Expect(err).Should(Succeed())
@@ -573,18 +580,18 @@ var _ = Describe("Running DNS server", func() {
 func requestServer(request *dns.Msg) *dns.Msg {
 	conn, err := net.Dial("udp", ":55555")
 	if err != nil {
-		log.Fatal("could not connect to server: ", err)
+		Log().Fatal("could not connect to server: ", err)
 	}
 	defer conn.Close()
 
 	msg, err := request.Pack()
 	if err != nil {
-		log.Fatal("can't pack request: ", err)
+		Log().Fatal("can't pack request: ", err)
 	}
 
 	_, err = conn.Write(msg)
 	if err != nil {
-		log.Fatal("can't send request to server: ", err)
+		Log().Fatal("can't send request to server: ", err)
 	}
 
 	out := make([]byte, 1024)
@@ -594,13 +601,13 @@ func requestServer(request *dns.Msg) *dns.Msg {
 		err := response.Unpack(out)
 
 		if err != nil {
-			log.Fatal("can't unpack response: ", err)
+			Log().Fatal("can't unpack response: ", err)
 		}
 
 		return response
 	}
 
-	log.Fatal("could not read from connection", err)
+	Log().Fatal("could not read from connection", err)
 
 	return nil
 }

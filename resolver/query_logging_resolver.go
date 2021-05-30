@@ -41,6 +41,7 @@ type queryLogEntry struct {
 	logger     *logrus.Entry
 }
 
+// NewQueryLoggingResolver returns a new resolver instance
 func NewQueryLoggingResolver(cfg config.QueryLogConfig) ChainedResolver {
 	if _, err := os.Stat(cfg.Dir); cfg.Dir != "" && err != nil && os.IsNotExist(err) {
 		logger(queryLoggingResolverPrefix).Fatalf("query log directory '%s' does not exist or is not writable", cfg.Dir)
@@ -100,15 +101,14 @@ func (r *QueryLoggingResolver) doCleanUp() {
 					}).Info("existing log file is older than retention time and will be deleted")
 
 					err := os.Remove(filepath.Join(r.logDir, f.Name()))
-					if err != nil {
-						logger.WithField("file", f.Name()).Error("can't remove file: ", err)
-					}
+					util.LogOnErrorWithEntry(logger.WithField("file", f.Name()), "can't remove file: ", err)
 				}
 			}
 		}
 	}
 }
 
+// Resolve logs the query, duration and the result
 func (r *QueryLoggingResolver) Resolve(request *Request) (*Response, error) {
 	logger := withPrefix(request.Log, queryLoggingResolverPrefix)
 
@@ -155,15 +155,13 @@ func (r *QueryLoggingResolver) writeLog() {
 
 			file, err := os.OpenFile(writePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 
-			if err != nil {
-				logEntry.logger.WithField("file_name", writePath).Error("can't create/open file", err)
-			} else {
+			util.LogOnErrorWithEntry(logEntry.logger.WithField("file_name", writePath), "can't create/open file", err)
+
+			if err == nil {
 				writer := createCsvWriter(file)
 
 				err := writer.Write(createQueryLogRow(logEntry))
-				if err != nil {
-					logEntry.logger.WithField("file_name", writePath).Error("can't write to file", err)
-				}
+				util.LogOnErrorWithEntry(logEntry.logger.WithField("file_name", writePath), "can't write to file", err)
 				writer.Flush()
 
 				_ = file.Close()
@@ -217,6 +215,7 @@ func createQueryLogRow(logEntry *queryLogEntry) []string {
 	}
 }
 
+// Configuration returns the current resolver configuration
 func (r *QueryLoggingResolver) Configuration() (result []string) {
 	if r.logDir != "" {
 		result = append(result, fmt.Sprintf("logDir= \"%s\"", r.logDir))
